@@ -11,5 +11,6 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/views", "src/components", "src/assets", "src/App.tsx", "src/main.tsx", "src/App.css", "src/index.css"]
 }
