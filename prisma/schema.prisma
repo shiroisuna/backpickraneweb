@@ -1,0 +1,283 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum Rol {
+  CLIENTE
+  GRUERO
+  ADMIN
+}
+
+enum EstadoCertificacion {
+  PENDIENTE
+  EN_REVISION
+  APROBADO
+  RECHAZADO
+}
+
+enum TipoDocumento {
+  FOTO_GRUA
+  LICENCIA
+  CERTIFICADO_MEDICO
+  RCV
+}
+
+// El servicio ahora siempre va dirigido a un gruero específico (elegido por
+// el cliente), no a un pool abierto: PENDIENTE_PAGO (solo pago móvil, hasta
+// que el admin lo confirme) -> SOLICITADO (el gruero ya puede aceptar/rechazar)
+// -> ASIGNADO -> EN_CAMINO -> LLEGADA -> EN_TRASLADO -> COMPLETADO.
+enum EstadoServicio {
+  PENDIENTE_PAGO
+  SOLICITADO
+  ASIGNADO
+  EN_CAMINO
+  LLEGADA
+  EN_TRASLADO
+  COMPLETADO
+  CANCELADO
+}
+
+enum MetodoPago {
+  EFECTIVO
+  PAGO_MOVIL
+  SALDO
+}
+
+enum EstadoPago {
+  PENDIENTE
+  CONFIRMADO
+  RECHAZADO
+}
+
+model Usuario {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  nombre    String
+  telefono  String?
+  rol       Rol
+  // Saldo interno a favor del cliente (ej. vuelto de pagos en efectivo),
+  // utilizable como abono en servicios futuros.
+  saldoAFavor Float  @default(0)
+  fotoPerfilUrl String?
+  cedula        String?
+  direccion     String? @db.Text
+  createdAt DateTime @default(now())
+
+  // Verificación de correo al registrarse.
+  emailVerificado         Boolean   @default(false)
+  tokenVerificacion       String?   @unique
+  tokenVerificacionExpira DateTime?
+
+  // Recuperación de contraseña ("olvidé mi contraseña").
+  tokenRecuperacion       String?   @unique
+  tokenRecuperacionExpira DateTime?
+
+  grueroPerfil         GrueroPerfil?
+  serviciosComoCliente Servicio[]    @relation("ClienteServicios")
+  mensajesEnviados     Mensaje[]
+  solicitudesPago      SolicitudPago[]
+}
+
+model GrueroPerfil {
+  id        String @id @default(uuid())
+  usuarioId String @unique
+  usuario   Usuario @relation(fields: [usuarioId], references: [id])
+
+  estadoCertificacion EstadoCertificacion @default(PENDIENTE)
+
+  tipoGrua  String
+  placa     String  @unique
+  direccion String @db.Text
+  latitud   Float
+  longitud  Float
+
+  // Ubicación en vivo (se actualiza vía Socket.IO cuando el gruero está activo)
+  activo              Boolean   @default(false)
+  ultimaLat           Float?
+  ultimaLng           Float?
+  ultimaActualizacion DateTime?
+
+  // Saldo que la plataforma le debe al gruero (de servicios pagados por
+  // Pago Móvil o Saldo, donde el dinero lo recibe la app y no el gruero
+  // directamente) — el admin lo liquida manualmente desde su panel.
+  saldoPendientePago Float @default(0)
+
+  documentos          Documento[]
+  serviciosComoGruero Servicio[]  @relation("GrueroServicios")
+  calificaciones      Calificacion[]
+  membresias          Membresia[]
+  solicitudesPago     SolicitudPago[]
+
+  createdAt DateTime @default(now())
+}
+
+model Documento {
+  id             String        @id @default(uuid())
+  grueroPerfilId String
+  grueroPerfil   GrueroPerfil  @relation(fields: [grueroPerfilId], references: [id])
+  tipo           TipoDocumento
+  archivoUrl     String
+  createdAt      DateTime      @default(now())
+}
+
+model Servicio {
+  id             String  @id @default(uuid())
+  clienteId      String
+  cliente        Usuario @relation("ClienteServicios", fields: [clienteId], references: [id])
+  grueroPerfilId String?
+  gruero         GrueroPerfil? @relation("GrueroServicios", fields: [grueroPerfilId], references: [id])
+
+  origenLat        Float
+  origenLng        Float
+  origenDireccion  String  @db.Text
+  destinoLat       Float
+  destinoLng       Float
+  destinoDireccion String  @db.Text
+
+  distanciaKm    Float?
+  duracionMin    Int?
+  tarifaEstimada Float?
+
+  estado EstadoServicio @default(SOLICITADO)
+
+  // Marcas de tiempo por etapa, para medir el rendimiento del gruero
+  // (tiempo en llegar, tiempo en enganchar/subir el vehículo, tiempo en
+  // trasladarlo hasta el destino). Se registran solas al cambiar de estado.
+  horaAsignado   DateTime?
+  horaEnCamino   DateTime?
+  horaLlegada    DateTime?
+  horaEnTraslado DateTime?
+  horaCompletado DateTime?
+
+  // Foto opcional del vehículo ya enganchado / montado en la plataforma,
+  // subida por el gruero al iniciar el traslado (evidencia para el cliente
+  // y para soporte administrativo).
+  fotoEnganche String?
+
+  pago         Pago?
+  calificacion Calificacion?
+  mensajes     Mensaje[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Pago {
+  id         String     @id @default(uuid())
+  servicioId String     @unique
+  servicio   Servicio   @relation(fields: [servicioId], references: [id])
+  metodo     MetodoPago
+  estado     EstadoPago @default(PENDIENTE)
+
+  monto Float // tarifa acordada (calculada server-side según distancia)
+
+  // Pago móvil: el cliente declara la referencia al crear la solicitud;
+  // el admin la revisa y confirma o rechaza.
+  referencia String?
+
+  // Efectivo: lo que el cliente indicó que va a entregar (para el vuelto) y
+  // la comisión de la plataforma (1.5%), calculada cuando el gruero declara
+  // el cobro al completar el servicio.
+  montoEntregado      Float?
+  vuelto              Float?
+  comisionPlataforma  Float?
+  declaradoPorGrueroEn DateTime?
+  confirmadoEn        DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+model Calificacion {
+  id             String       @id @default(uuid())
+  servicioId     String       @unique
+  servicio       Servicio     @relation(fields: [servicioId], references: [id])
+  grueroPerfilId String
+  gruero         GrueroPerfil @relation(fields: [grueroPerfilId], references: [id])
+
+  estrellas  Int // 1 a 5
+  comentario String?
+
+  createdAt DateTime @default(now())
+}
+
+model Mensaje {
+  id         String   @id @default(uuid())
+  servicioId String
+  servicio   Servicio @relation(fields: [servicioId], references: [id])
+  autorId    String
+  autor      Usuario  @relation(fields: [autorId], references: [id])
+
+  texto String @db.Text
+
+  createdAt DateTime @default(now())
+}
+
+/**
+ * Membresía mensual que cada gruero paga por usar la plataforma ($10 por
+ * defecto). Se declara igual que un pago móvil (con referencia), y el admin
+ * la confirma o rechaza — aparece en el módulo de movimientos del admin
+ * identificada como "Membresía Gruero", con el usuario, fecha y hora.
+ */
+model Membresia {
+  id             String       @id @default(uuid())
+  grueroPerfilId String
+  gruero         GrueroPerfil @relation(fields: [grueroPerfilId], references: [id])
+
+  monto      Float  @default(10)
+  referencia String?
+  estado     EstadoPago @default(PENDIENTE)
+  confirmadoEn DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+/**
+ * Datos de Pago Móvil de la app (a dónde transfieren los clientes),
+ * editables por el admin. Se guarda una sola fila; si no existe ninguna,
+ * el backend cae a las variables de entorno como valor por defecto.
+ */
+model ConfiguracionPagoMovil {
+  id         String   @id @default(uuid())
+  banco      String
+  telefono   String
+  cedulaORif String
+  updatedAt  DateTime @updatedAt
+}
+
+/**
+ * Solicitud de pago: el gruero pide que le paguen su saldo pendiente (o
+ * parte de él), indicando el monto y su propio Pago Móvil para recibirlo.
+ * Aparece en "Saldos Pendientes" del admin hasta que se marca como pagada
+ * (ahí se descuenta el monto del saldo pendiente del gruero y queda
+ * registrada en Movimientos con fecha y hora).
+ */
+/**
+ * Solicitud de retiro/pago: la hace un gruero (de su saldo pendiente por
+ * Pago Móvil/Saldo) o un cliente (de su saldo a favor acumulado de
+ * vueltos) — exactamente uno de los dos campos de relación va lleno.
+ * Aparece en "Saldos Pendientes" del admin hasta que se marca como pagada
+ * (ahí se descuenta del saldo correspondiente y queda en Movimientos).
+ */
+model SolicitudPago {
+  id             String        @id @default(uuid())
+  grueroPerfilId String?
+  gruero         GrueroPerfil? @relation(fields: [grueroPerfilId], references: [id])
+  clienteId      String?
+  cliente        Usuario?      @relation(fields: [clienteId], references: [id])
+
+  monto      Float
+  banco      String
+  telefono   String
+  cedulaORif String
+
+  estado   EstadoPago @default(PENDIENTE)
+  pagadoEn DateTime?
+
+  createdAt DateTime @default(now())
+}
